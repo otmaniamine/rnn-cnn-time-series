@@ -69,6 +69,8 @@ class PrecipDataset(Dataset):
       # Normalisation par fenêtre         <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
       mean_w = window.mean()
       std_w = window.std() + 1e-8
+      #window = (window - mean_w)     # le decalage vertical a été retiré (reglé), mais  le signal reconstruit n'est pas bon 
+
       window = (window - mean_w) / std_w
       x = torch.from_numpy(window).unsqueeze(0)
       return x, x
@@ -300,10 +302,80 @@ def train():
     plt.suptitle(f'voieBasse – Reconstruction  latent={LATENT_DIM}')
     plt.tight_layout(); plt.show()
     
+    
+    #
     print(f"Hyperparamètres : LR={LR}, latent_dim={LATENT_DIM}, batch_size={BATCH_SIZE}, n_epochs={N_EPOCHS}, data_fraction={DATA_FRACTION}, window_size={WINDOW_SIZE}, stride={STRIDE}")
     x_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     torch.save(model.state_dict(), "best_AE_1505_norm_par_fenetre_"+x_time +".pth")
+    
+    
 
+    #Exploration de l'espace latent et histogram────────────────────────────────────────
+    all_z = []
+
+    with torch.no_grad():
+        for x_batch, _ in test_loader:
+            z = model.encode(x_batch.to(device))
+            all_z.append(z.cpu().numpy())
+
+    Z = np.concatenate(all_z, axis=0)   # (N_test, LATENT_DIM)
+    print(f"Espace latent shape : {Z.shape}")
+    print(f"  min={Z.min():.3f}  max={Z.max():.3f}  std={Z.std():.3f}")
+# ── Distribution de chaque dimension ────────────────────────────────────────
+    n_cols = min(8, LATENT_DIM)
+    n_rows = (LATENT_DIM + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.5*n_cols, 2.5*n_rows))
+    axes = np.array(axes).flatten()
+
+    for dim in range(LATENT_DIM):
+        axes[dim].hist(Z[:, dim], bins=30, color='steelblue', alpha=0.7)
+        axes[dim].set_title(f'z[{dim}]', fontsize=9)
+        axes[dim].tick_params(labelsize=7)
+
+    # Masquer les axes vides
+    for ax in axes[LATENT_DIM:]:
+        ax.set_visible(False)
+
+    plt.suptitle(f'Distribution des dimensions latentes – Archi {ARCHITECTURE} | Latent={LATENT_DIM}', fontsize=11)
+    plt.tight_layout()
+    plt.show()    
+    
+
+    
+"""
+model.eval()
+all_z = []
+
+with torch.no_grad():
+    for x_batch, _ in test_loader:
+        z = model.encode(x_batch.to(device))
+        all_z.append(z.cpu().numpy())
+
+Z = np.concatenate(all_z, axis=0)   # (N_test, LATENT_DIM)
+print(f"Espace latent shape : {Z.shape}")
+print(f"  min={Z.min():.3f}  max={Z.max():.3f}  std={Z.std():.3f}")
+
+# ── Distribution de chaque dimension ─────────────────────────────────────────
+n_cols = min(8, LATENT_DIM)
+n_rows = (LATENT_DIM + n_cols - 1) // n_cols
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.5*n_cols, 2.5*n_rows))
+axes = np.array(axes).flatten()
+
+for dim in range(LATENT_DIM):
+    axes[dim].hist(Z[:, dim], bins=30, color='steelblue', alpha=0.7)
+    axes[dim].set_title(f'z[{dim}]', fontsize=9)
+    axes[dim].tick_params(labelsize=7)
+
+# Masquer les axes vides
+for ax in axes[LATENT_DIM:]:
+    ax.set_visible(False)
+
+plt.suptitle(f'Distribution des dimensions latentes – Archi {ARCHITECTURE} | Latent={LATENT_DIM}', fontsize=11)
+plt.tight_layout()
+plt.show()
+
+  
+"""
 
 
 
