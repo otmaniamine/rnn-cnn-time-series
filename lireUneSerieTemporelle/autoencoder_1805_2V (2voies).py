@@ -1,11 +1,8 @@
 """
-AutoEncoder – voieBasse  (1 seul canal)
-le 15/05/2026
-c'est le fichier 1305 avec quelque commentaires et sauvgarde du modèle à la fin de l'entraînement apres le meeting sans correction verticale
-"""
+AutoEncoder – 2 voies (voieHaute + voieBasse)
 
+"""
 from datetime import datetime
-from pyexpat import model
 import sys, os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,9 +14,9 @@ sys.path.insert(0, os.path.abspath('./pydata'))
 from pydata.disdrometre import Disdro
 from pydata.fichiers_de_gouttes_sph import dbs_load_bin
 
-# ══════════════════════════════════════════════════════════
-#  CONFIG
-# ══════════════════════════════════════════════════════════
+
+
+
 file_list = ('Temporel_DBS1_20220720.bin0002',
                      'Temporel_DBS1_20221014.bin0006',
                      'Temporel_DBS1_20221220.bin0002',
@@ -28,35 +25,38 @@ file_list = ('Temporel_DBS1_20220720.bin0002',
                      'Temporel_DBS1_20240823.bin0003',
                      'Temporel_DBS1_20240823.bin0003',
                      'Temporel_DBS1_20240830.bin0004')
+#----CONFIG---------------------------------------
 FICHIER       = './bin/'+file_list[0]
-
-DATA_FRACTION = 1 
+DATA_FRACTION = 1  
 
 WINDOW_SIZE   = 512
 STRIDE        = 256 
 
-LATENT_DIM    = 32      #8,32
+LATENT_DIM    = 64      #8,32
 BATCH_SIZE    = 32
-N_EPOCHS      = 70  #+ early stopping  !!
-LR            = 1e-3     
+N_EPOCHS      = 70
+LR            = 1e-3
+ARCHITECTURE  = '2voies'
 
 
-
-
-# ── Dataset ───────────────────────────────────────────────----------------------------------------
+# ── Dataset ----------------------------------------
 class PrecipDataset(Dataset):
     def __init__(self):
         raw = dbs_load_bin(FICHIER, Disdro('dbs1'))
-        vb  = raw['voieBasse'].astype(np.float32)
 
-        n  = int(len(vb) * DATA_FRACTION)
+        vh = raw['voieHaute'].astype(np.float32)
+        vb = raw['voieBasse'].astype(np.float32)
+
+        n  = int(len(vh) * DATA_FRACTION)
+        vh = vh[:n]
         vb = vb[:n]
 
-        # normalisation z-score
+        # normalisation z-score par voie
+        vh = (vh - vh.mean()) / (vh.std() + 1e-8)
         vb = (vb - vb.mean()) / (vb.std() + 1e-8)
 
-        #  self.signal : np.ndarray 
-        self.signal    = np.asarray(vb, dtype=np.float32)
+        # self.signal : shape (2, N)
+        self.signal    = np.stack([vh, vb], axis=0).astype(np.float32) #////////!!
         self.n_windows = (n - WINDOW_SIZE) // STRIDE + 1
         print(f"Points : {n:,}  |  Fenêtres : {self.n_windows:,}")
 
@@ -64,41 +64,40 @@ class PrecipDataset(Dataset):
         return self.n_windows
 
     def __getitem__(self, idx):
-        s = idx * STRIDE
-        x = torch.from_numpy(self.signal[s:s + WINDOW_SIZE])
-        x = x.unsqueeze(0)   # (1, 512) ← 1 canal        !!!!!!!!!   
-        return x, x  #la sortie est la même que l'entrée 
+      s = idx * STRIDE
+      window = self.signal[:, s:s + WINDOW_SIZE].copy()  # shape (2, WINDOW_SIZE)
+
+      # Normalisation par fenêtre (par voie)
+      mean_w = window.mean(axis=1, keepdims=True)
+      std_w = window.std(axis=1, keepdims=True) + 1e-8
+      window = (window - mean_w) / std_w
+
+      x = torch.from_numpy(window)
+      return x, x
 
 
 
-
-
-# ── Modèle 1  : avec 3 conv  ────────────────────────────────────────────────--------------------------
+# ── Modèle 2  : avec 3 conv  ────────────────────────────────────────────────
 class AutoEncoder(nn.Module):
     def __init__(self):
         super().__init__()
 
-        #  réduction par 2 : k=4, s=2, p=1
-        # Entrée : (Batch, 1, 512)
-        
-        # ── Encodeur ─────────────────────────────── 
+        # Entrée : (Batch, 2, 512)
         self.enc_conv = nn.Sequential(
             # Couche 1 : 512 -> 256
-            nn.Conv1d(1, 16, kernel_size=4, stride=2, padding=1),
+            nn.Conv1d(2, 16, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm1d(16),
-            nn.LeakyReLU(0.3),
-            #nn.Dropout1d(0.1),
+            nn.LeakyReLU(0.5),
             
             # Couche 2 : 256 -> 128
             nn.Conv1d(16, 32, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.3 ),
-            #nn.Dropout1d(0.1),
+            nn.LeakyReLU(0.5),
             
             # Couche 3 : 128 -> 64
             nn.Conv1d(32, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.3),
+            nn.LeakyReLU(0.5),
         )
         
         self._L, self._ch = 64, 64
@@ -107,7 +106,7 @@ class AutoEncoder(nn.Module):
         # MLP Encodeur 
         self.enc_mlp = nn.Sequential(
             nn.Linear(self.flat_size, 128),
-            nn.LeakyReLU(0.3),
+            nn.LeakyReLU(0.5),
             nn.Linear(128, LATENT_DIM)
         )
 
@@ -115,11 +114,10 @@ class AutoEncoder(nn.Module):
         # MLP Décodeur :
         self.dec_mlp = nn.Sequential(
             nn.Linear(LATENT_DIM, 128),
-            nn.LeakyReLU(0.3),
+            nn.LeakyReLU(0.0),
             nn.Linear(128, self.flat_size),
-            nn.LeakyReLU(0.3)
+            nn.LeakyReLU(0.5)
         )
-        
 
         self.dec_conv = nn.Sequential(
             # Couche 1 : 64 -> 128
@@ -130,11 +128,10 @@ class AutoEncoder(nn.Module):
             # Couche 2 : 128 -> 256
             nn.ConvTranspose1d(32, 16, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm1d(16),
-            nn.LeakyReLU(0.3),
+            nn.LeakyReLU(0.5),
             
-            # Couche 3 : 256 -> 512 (Pas d'activation à la fin car Z-score !)
-            nn.ConvTranspose1d(16, 1, kernel_size=4, stride=2, padding=1),
-            #nn.Tanh()
+            # Couche 3 : 256 -> 512 (2 voies)
+            nn.ConvTranspose1d(16, 2, kernel_size=4, stride=2, padding=1),
         )
 
     def encode(self, x):
@@ -148,13 +145,8 @@ class AutoEncoder(nn.Module):
 
     def forward(self, x):
         return self.decode(self.encode(x))
-      
-#model 2 : avec 4 conv  (pour faire une réduction plus forte et voir si on peut faire mieux avec un latent plus petit)  (mais cela rend le modèle plus lourd et plus long à entraîner, et on perd en précision sur la reconstruction, surtout pour les petites gouttes qui ont des signaux plus faibles et plus courts, et qui sont plus sensibles au bruit et aux variations du signal, et qui sont aussi plus difficiles à détecter et à reconstruire, car elles ont des formes de signal plus complexes et moins régulières que les grosses gouttes qui ont des signaux plus forts et plus longs, et qui sont aussi plus faciles à détecter et à reconstruire, car elles ont des formes de signal plus simples et plus régulières que les petites gouttes, et qui sont aussi moins sensibles au bruit et aux variations du signal que les petites gouttes, car elles ont des signaux plus forts et plus longs que les petites gouttes, et qui sont aussi moins sensibles au bruit que les petites gouttes, car elles ont des signaux plus forts que les petites gouttes, et qui sont aussi moins sensibles aux variations du signal que les petites gouttes, car elles ont des signaux plus longs que les petites gouttes, et qui sont aussi moins sensibles au bruit que les petites gouttes, car elles ont des signaux plus forts que les petites gouttes, et qui sont aussi moins sensibles aux variations du signal que les petites gouttes, car elles ont des signaux plus longs que les petites gouttes, et qui sont aussi moins sensibles au bruit que les petites gouttes, car elles ont des signaux plus forts que les petites gouttes, et qui sont aussi moins sensibles aux variations du signal que les petites gouttes, car elles ont des signaux plus longs que les petites gouttes, et qui sont aussi moins sensibles au bruit que les petites gouttes, car elles ont des signaux plus forts que les petites gouttes, et qui sont aussi moins sensibles aux variations du signal que les petites gouttes, car elles ont des signaux plus longs que les petites gouttes, et qui sont aussi moins sensibles au bruit que les petites gouttes, car elles ont des signaux plus forts que les petites gouttes, et qui sont aussi moins sensibles aux variations du signal que les petites gouttes, car elles ont des signaux plus longs que les petites gouttes, et qui sont aussi moins sensibles au bruit que les petites gouttes, car elles ont des signaux plus forts
-      
-      
-      
-      
-      
+
+
 # ── Entraînement ──────────────────────────────────────────-----------------------
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -172,13 +164,12 @@ def train():
 
     model     = AutoEncoder().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-  
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=5, verbose=True )
     criterion = nn.MSELoss()
     print(f"Paramètres : {sum(p.numel() for p in model.parameters()):,}")
 
     train_losses, val_losses = [], []
-
-
 
     for epoch in range(1, N_EPOCHS + 1):
         model.train()
@@ -204,12 +195,8 @@ def train():
         if epoch % 5 == 0 or epoch == 1:
             print(f"Epoch {epoch:3d}/{N_EPOCHS}  train={train_losses[-1]:.5f}  val={val_losses[-1]:.5f}")
 
-        
-    
-    
-    
     # ── Évaluation finale sur l'ensemble de TEST ──────────────────
-    from sklearn.metrics import r2_score
+    from sklearn.metrics import r2_score # pour mesurer la qualité de la reconstruction
     model.eval()
     test_loss = 0.0
     all_x, all_x_hat = [], [] # Pour stocker les signaux et calculer le R2
@@ -219,58 +206,43 @@ def train():
             x = x.to(device)
             x_hat = model(x)
             test_loss += criterion(x_hat, x).item() * x.size(0)
-            
-            all_x.append(x.cpu().view(-1).numpy())
-            all_x_hat.append(x_hat.cpu().view(-1).numpy())
-    
+            all_x.append(x.cpu().reshape(-1).numpy())
+            all_x_hat.append(x_hat.cpu().reshape(-1).numpy())
+
     test_loss /= n_te
-    
-    # Calcul du R2 () (équivalent de l'accuracy) # **********
+
     y_true = np.concatenate(all_x)
     y_pred = np.concatenate(all_x_hat)
     accuracy_r2 = r2_score(y_true, y_pred)
 
     print("\n" + "═"*50)
     print(f"ERREUR FINALE (MSE) : {test_loss:.5f}")
-    print(f"ACCURACY (R² Score) : {accuracy_r2:.2%}") # Affiche en %
+    print(f"ACCURACY (R² Score) : {accuracy_r2:.2%}")
     print("═"*50 + "\n")
-  
-    
-#if False :   
-    #_________pca____________________________________________________________________
+
+    # PCA sur latents
     from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-    
-    # Après l'entraînement, récupérer les latents sur le test set
     model.eval()
     latents = []
     with torch.no_grad():
         for x, _ in test_loader:
             x = x.to(device)
-            z = model.encode(x)  # shape (batch, LATENT_DIM)
+            z = model.encode(x)
             latents.append(z.cpu().numpy())
     latents = np.concatenate(latents, axis=0)
-    
-   
+
     pca = PCA(n_components=2)
     latents_pca = pca.fit_transform(latents)
-    
-    # Visualisation
+
     plt.figure(figsize=(8, 6))
     plt.scatter(latents_pca[:, 0], latents_pca[:, 1], s=1, alpha=0.5)
     plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%})')
     plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%})')
     plt.title(f'ACP de l\'espace latent (dim={LATENT_DIM})')
     plt.grid(alpha=0.3)
-    plt.show()   
-    #_____________________________________________________________________________
-    
-    
-    
-    
-    
+    plt.show()
 
-    # ── Courbes ───────────────────────────────────────────
+    # ── Courbes de loss ───────────────────────────────────────────
     plt.figure(figsize=(8, 3))
     plt.plot(train_losses, label='Train')
     plt.plot(val_losses,   label='Val', linestyle='--')
@@ -286,29 +258,93 @@ def train():
     x_np = x_batch.numpy()
 
     t = np.arange(WINDOW_SIZE) * 8e-5 * 1000   # ms
-    fig, axes = plt.subplots(1, 3, figsize=(14, 3))
-    for i, ax in enumerate(axes):
+    # Afficher 3 exemples, chaque exemple a deux sous-graphes (Haute / Basse)
+    fig, axes = plt.subplots(3, 2, figsize=(12, 8))
+    for i in range(3):
+        # Haute (colonne 0)
+        ax = axes[i, 0]
         ax.plot(t, x_np[i, 0],  label='Original',    lw=0.9)
         ax.plot(t, x_hat[i, 0], label='Reconstruit', lw=0.9, linestyle='--')
-        ax.set_title(f'Exemple {i+1}')
+        ax.set_title(f'Haute - Exemple {i+1}')
         ax.set_xlabel('ms'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
-    plt.suptitle(f'voieBasse – Reconstruction  latent={LATENT_DIM}')
+
+        # Basse (colonne 1)
+        ax = axes[i, 1]
+        ax.plot(t, x_np[i, 1],  label='Original',    lw=0.9)
+        ax.plot(t, x_hat[i, 1], label='Reconstruit', lw=0.9, linestyle='--')
+        ax.set_title(f'Basse - Exemple {i+1}')
+        ax.set_xlabel('ms'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    plt.suptitle(f'2 voies – Reconstruction  latent={LATENT_DIM}')
     plt.tight_layout(); plt.show()
-    
+
     print(f"Hyperparamètres : LR={LR}, latent_dim={LATENT_DIM}, batch_size={BATCH_SIZE}, n_epochs={N_EPOCHS}, data_fraction={DATA_FRACTION}, window_size={WINDOW_SIZE}, stride={STRIDE}")
     x_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-#    torch.save(model.state_dict(), "best_autoencoder_"+x_time +".pth")
-# + histogrames des latents  (pour voir si on a des valeurs extrêmes ou pas)
+    #torch.save(model.state_dict(), "best_AE_1805_2V_"+x_time +".pth") 
+    # "best_AE_1805_2V_2026-05-19_15-43-24.pth"
+    
+    import seaborn as sns
+    import pandas as pd
 
+    
+  
+    #------- ANALYSE DE L'ESPACE LATENT SUR LES 3 ENSEMBLES -----------------------------------------
+
+    def extract_latent_space(loader):
+        """Extrait les vecteurs Z pour un DataLoader donné."""
+        all_z = []
+        with torch.no_grad():
+            for x_batch, _ in loader:
+                z = model.encode(x_batch.to(device))
+                all_z.append(z.cpu().numpy())
+        return np.concatenate(all_z, axis=0)
+
+    # Dictionnaire de DataLoaders 
+    loaders = {
+        "Entrainement": train_loader,
+        "Validation": val_loader,
+        "Test": test_loader
+    }
+
+    max_dims_pairplot = min(8, LATENT_DIM) # Limite pour éviter de surcharger le graphique
+
+    for nom_ensemble, loader in loaders.items():
+        print(f"\nExtraction et Analyse pour l'ensemble : {nom_ensemble}...")
+        Z = extract_latent_space(loader)
+        
+        print(f"  Shape : {Z.shape}")
+        print(f"  min={Z.min():.3f}  max={Z.max():.3f}  std={Z.std():.3f}")
+
+        # Conversion en DataFrame Pandas pour faciliter l'analyse
+        colonnes = [f'z{i}' for i in range(LATENT_DIM)]
+        df_Z = pd.DataFrame(Z, columns=colonnes)
+
+
+      # --- 1. Matrice de Corrélation ---
+        corr_matrix = df_Z.corr()
+        
+        plt.figure(figsize=(10, 8))
+        # CHANGEMENT ICI : ajout de vmin=-1 et vmax=1, et utilisation de 'coolwarm'
+        sns.heatmap(corr_matrix, annot=(LATENT_DIM <= 16), cmap='coolwarm', 
+                    vmin=-1, vmax=1, center=0, fmt=".2f", square=True, 
+                    cbar_kws={'label': 'Coefficient de Pearson'})
+        
+        plt.title(f"Matrice de Corrélation Linéaire - Ensemble de {nom_ensemble}\n(Archi: {ARCHITECTURE} | Latent: {LATENT_DIM})", fontsize=12)
+        plt.tight_layout()
+        plt.show()
+
+        # --- 2. Histograms et Histogrammes 2D (Pairplot) ---
+        colonnes_pairplot = colonnes[:max_dims_pairplot]
+        
+        print(f"  Génération du Pairplot de densité pour les {max_dims_pairplot} premières dimensions...")
+        
+        fig_pair = sns.pairplot(df_Z[colonnes_pairplot], corner=True, kind='hist',
+                                plot_kws={'cmap': 'Blues', 'bins': 30})
+        
+        fig_pair.fig.suptitle(f'Distributions et Densité - Ensemble de {nom_ensemble}', y=1.02, fontsize=12)
+        plt.show()
+        # gausien + decorrelation => independance
 
 
 if __name__ == '__main__':
-     
     train()
- 
-    
- 
-    
- 
-    
- #---------------output------------------------------------------------------------------------------------------
